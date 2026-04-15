@@ -1,50 +1,129 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import Response
-import numpy as np
+from fastapi import FastAPI, Query, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, FileResponse
 import cv2
 from ultralytics import YOLO
 
 app = FastAPI()
 
+# Load model
 model = YOLO("yolov8n.pt")
+
+# ------------------- 🎥 LIVE STREAM -------------------
+
+def generate_frames(target: str = None):
+    cap = cv2.VideoCapture(0)
+    frame_count = 0
+
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+
+        frame_count += 1
+
+        frame = cv2.resize(frame, (640, 480))
+
+        if frame_count % 3 != 0:
+            _, buffer = cv2.imencode('.jpg', frame)
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            continue
+
+        results = model(frame, imgsz=320)[0]
+
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            label = model.names[cls_id]
+
+            if target and target.lower() not in label.lower():
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+            cv2.putText(frame, label, (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+        _, buffer = cv2.imencode('.jpg', frame)
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
 
 @app.get("/")
 def home():
-    return {"message": "API Running"}
+    return {"message": "Video Detection API Running"}
 
-@app.post("/detect")
-async def detect(file: UploadFile = File(...), target: str = Form(...)):
-    contents = await file.read()
 
-    # Convert to image
-    np_arr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+@app.get("/detect_video")
+def video_feed(target: str = Query(None)):
+    return StreamingResponse(
+        generate_frames(target),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
-    if img is None:
-        return Response(content=b"", media_type="image/jpeg")
 
-    results = model(img)[0]
+# ------------------- 📤 VIDEO UPLOAD -------------------
 
-    target = target.lower().strip()
+@app.post("/upload_video")
+async def upload_video(file: UploadFile = File(...), target: str = Form(...)):
+    input_path = "input.mp4"
+    output_path = "output.mp4"
 
-    found = False
+    # Save file
+    with open(input_path, "wb") as f:
+        f.write(await file.read())
 
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        label = model.names[cls_id].lower()
+    cap = cv2.VideoCapture(input_path)
 
-        if target in label:
-            found = True
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+    # 🔥 FIX 1: Handle FPS properly
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps == 0 or fps != fps:   # handles NaN also
+        fps = 20
 
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,0), 2)
-            cv2.putText(img, label, (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+    fps = float(fps)
 
-    # Encode safely
-    success, buffer = cv2.imencode(".jpg", img)
+    width, height = 640, 480
 
-    if not success:
-        return Response(content=b"", media_type="image/jpeg")
+    # 🔥 FIX 2: Proper VideoWriter
+    out = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        fps,
+        (640,480)
+    )
 
-    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+
+        frame = cv2.resize(frame, (width, height))
+
+        # Skip frames
+        if frame_count % 5 != 0:
+            out.write(frame)
+            continue
+
+        results = model(frame, imgsz=320)[0]
+
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            label = model.names[cls_id].lower()
+
+            if target.lower() in label:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                cv2.putText(frame, label, (x1, y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+        out.write(frame)
+
+    # 🔥 FIX 3: Proper release
+    cap.release()
+    out.release()
+
+    # 🔥 FIX 4: Return only after closing writer
+    return FileResponse(output_path, media_type="video/mp4")
